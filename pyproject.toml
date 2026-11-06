@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yt_idv_export"
+version = "0.1.0"
+description = "Export yt data as yt_idv scene files, without yt_idv or OpenGL"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Matthew Turk", email = "matthewturk@gmail.com" },
+]
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "yt>=4.1.0",
+]
+
+[project.optional-dependencies]
+mpi = ["mpi4py"]
+test = ["pytest"]
+
+[project.scripts]
+yt-idv-export = "yt_idv_export:main"
+
+[tool.setuptools]
+py-modules = ["yt_idv_export"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
