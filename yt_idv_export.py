@@ -5,7 +5,7 @@ This file only depends on yt and numpy, so it can be copied to and run on a
 machine where yt_idv (or OpenGL) is not available:
 
     yt-idv-export DATASET FIELD OUTPUT [--no-ghost] [--float64]
-        [--checkpoint-dir DIR]
+        [--float64-textures] [--checkpoint-dir DIR]
 
 or, from python:
 
@@ -22,10 +22,12 @@ Only cartesian geometries are supported. The block processing mirrors
 ``BlockCollection.add_data`` and the file layout mirrors
 ``yt_idv.serialization``.
 
-With ``--float64`` the vertex geometry and texture data are stored in float64;
-yt_idv casts them down to float32 only for the GPU. That keeps deep zooms into
-highly refined data exact, at the cost of a larger file (the textures double in
-size), and needs a yt_idv that can load float64 scenes.
+With ``--float64`` the vertex geometry (the blocks' edges and cell widths) is
+stored in float64, as yt_idv keeps it; yt_idv casts it down to float32 only for
+the GPU. That keeps deep zooms into highly refined data exact, and adds little
+to the file. With ``--float64-textures`` the texture data is stored in float64
+too, which doubles the size of the textures and needs a yt_idv that can load
+float64 textures; the GPU still gets float32.
 
 With ``--checkpoint-dir`` each block is saved to that directory as soon as yt
 has generated it, so an export that is killed (e.g., by a batch job's time
@@ -458,7 +460,7 @@ def _block_sizes(tiles, no_ghost):
     return np.array(levels), np.array(cells), np.array(values), len(grids)
 
 
-def _summarize_blocks(tiles, no_ghost, float64):
+def _summarize_blocks(tiles, no_ghost, float64_textures):
     levels, cells, values, n_grids = _block_sizes(tiles, no_ghost)
     lines = [
         f"{n_grids} of the dataset's {len(tiles.ds.index.grids)} grids are "
@@ -474,7 +476,7 @@ def _summarize_blocks(tiles, no_ghost, float64):
         )
     lines.append(
         f"expected size: about {_format_bytes(values.sum() * 8 + cells.sum())} "
-        f"of checkpoint, {_format_bytes(values.sum() * (8 if float64 else 4))} "
+        f"of checkpoint, {_format_bytes(values.sum() * (8 if float64_textures else 4))} "
         "of scene file before any compression"
     )
     return lines, values
@@ -561,6 +563,7 @@ def export_block_scene(
     render_method=None,
     compress=False,
     float64=False,
+    float64_textures=False,
     checkpoint_dir=None,
     assemble=True,
     log_interval=300,
@@ -577,8 +580,10 @@ def export_block_scene(
     render_method: The BlockRendering render method (e.g., "projection");
                    uses the yt_idv default if None
     compress: Should the file be compressed (slower, but often smaller)
-    float64: Store the vertex geometry and texture data in float64 (yt_idv
-             casts them to float32 for the GPU); otherwise float32
+    float64: Store the vertex geometry in float64 (yt_idv casts it to
+             float32 for the GPU); otherwise float32
+    float64_textures: Store the texture data in float64 (yt_idv casts it to
+                      float32 for the GPU); otherwise float32
     checkpoint_dir: A directory to save each block to as it is generated, so
                     that an interrupted export can be resumed by calling this
                     again with the same arguments; removed once the file has
@@ -601,7 +606,7 @@ def export_block_scene(
     ds = data_source.ds
     if root:
         _log(f"built the kd tree in {_format_seconds(time.monotonic() - started)}")
-        for line in _summarize_blocks(tiles, no_ghost, float64)[0]:
+        for line in _summarize_blocks(tiles, no_ghost, float64_textures)[0]:
             _log(line)
     if checkpoint_dir is None and comm.size > 1:
         checkpoint_dir = f"{filename}.checkpoint"
@@ -639,6 +644,7 @@ def export_block_scene(
             "render_method": render_method,
             "compress": bool(compress),
             "float64": bool(float64),
+            "float64_textures": bool(float64_textures),
         }
         if checkpoint_dir is not None:
             store.save_scene(scene)
@@ -757,13 +763,19 @@ def _log_checkpoint(store, checkpoint_dir, n_blocks):
         _log(f"warning: ignoring block files beyond the last block: {stray[:10]}")
 
 
+def _float64_textures(scene):
+    # checkpoints from before the option was split stored both in float64
+    return scene.get("float64_textures", scene["float64"])
+
+
 def _write_scene(store, tree, scene, filename, log_interval=300):
     # Needs only numpy, so a checkpoint can be assembled on any machine.
     n_blocks = int((tree["block"] >= 0).sum())
     started = time.monotonic()
+    float64_textures = _float64_textures(scene)
     _log(
         f"writing {filename} from {n_blocks} blocks (float64={scene['float64']}, "
-        f"compress={scene['compress']})"
+        f"float64_textures={float64_textures}, compress={scene['compress']})"
     )
     keys = ("left_edge", "right_edge", "dx", "min_val", "max_val")
     summary = []
@@ -784,6 +796,7 @@ def _write_scene(store, tree, scene, filename, log_interval=300):
     ratio = scene["unitary_per_code_length"]
     bbox = np.array(scene["bbox"])
     dtype = "f8" if scene["float64"] else "f4"
+    texture_dtype = "f8" if float64_textures else "f4"
     render_method = scene["render_method"]
 
     mode = zipfile.ZIP_DEFLATED if scene["compress"] else zipfile.ZIP_STORED
@@ -827,7 +840,7 @@ def _write_scene(store, tree, scene, filename, log_interval=300):
                         n_data /= max_val
                         # zero-valued blocks are skipped by the shader
                         n_data[n_data == 0.0] = np.finfo(np.float32).tiny
-                    n_data = n_data.astype(dtype)
+                    n_data = n_data.astype(texture_dtype)
                     block_data.append([i, archive.add_array(n_data)])
                     block_bitmaps.append(
                         [i, archive.add_array((block["mask"] * 255).astype("uint8"))]
@@ -928,6 +941,7 @@ def diagnose_export(
     field,
     no_ghost=False,
     float64=False,
+    float64_textures=False,
     checkpoint_dir=None,
     n_ranks=1,
     n_sample=0,
@@ -947,6 +961,7 @@ def diagnose_export(
     field: The field to volume render
     no_ghost: As for export_block_scene
     float64: As for export_block_scene
+    float64_textures: As for export_block_scene
     checkpoint_dir: The checkpoint directory the export would use, if any
     n_ranks: The number of MPI ranks to plan for
     n_sample: The number of blocks to generate to time them
@@ -957,7 +972,7 @@ def diagnose_export(
         data_source, field, no_ghost, _communicator()
     )
     _log(f"built the kd tree in {_format_seconds(time.monotonic() - started)}")
-    lines, values = _summarize_blocks(tiles, no_ghost, float64)
+    lines, values = _summarize_blocks(tiles, no_ghost, float64_textures)
     for line in lines:
         _log(line)
     n_blocks = len(values)
@@ -1035,6 +1050,7 @@ def inspect_checkpoint(checkpoint_dir, verify=False):
     else:
         print(
             f"  scene file options: float64={scene['float64']}, "
+            f"float64_textures={_float64_textures(scene)}, "
             f"compress={scene['compress']}, render_method={scene['render_method']}"
         )
 
@@ -1268,7 +1284,12 @@ def main():
     parser.add_argument(
         "--float64",
         action="store_true",
-        help="store the geometry and texture data in float64 (larger file)",
+        help="store the vertex geometry in float64",
+    )
+    parser.add_argument(
+        "--float64-textures",
+        action="store_true",
+        help="store the texture data in float64 (doubles the textures' size)",
     )
     parser.add_argument(
         "--checkpoint-dir",
@@ -1335,6 +1356,7 @@ def main():
             field,
             no_ghost=args.no_ghost,
             float64=args.float64,
+            float64_textures=args.float64_textures,
             checkpoint_dir=args.checkpoint_dir,
             n_ranks=args.ranks,
             n_sample=args.sample,
@@ -1348,6 +1370,7 @@ def main():
         render_method=args.render_method,
         compress=args.compress,
         float64=args.float64,
+        float64_textures=args.float64_textures,
         checkpoint_dir=args.checkpoint_dir,
         assemble=not args.no_assemble,
         log_interval=args.log_interval,

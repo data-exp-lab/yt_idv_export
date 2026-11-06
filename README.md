@@ -8,10 +8,23 @@ It is a single module, `yt_idv_export.py`, that needs only numpy and yt
 (plus mpi4py for parallel exports). It can be installed, or copied and run on
 its own.
 
+Install it as a command-line tool with [uv](https://docs.astral.sh/uv/)
+(or pipx), or into an environment with pip:
+
 ```bash
-pip install .            # or: pip install ".[mpi]"
-yt-idv-export DATASET FIELD scene.zip [--no-ghost] [--float64]
+uv tool install /path/to/yt_idv_export          # or a git URL
+uv tool install "/path/to/yt_idv_export[mpi]"   # with mpi4py, for --parallel
+pip install .
 ```
+
+```bash
+yt-idv-export DATASET FIELD scene.zip [--no-ghost] [--float64] [--float64-textures]
+```
+
+`--float64` stores the blocks' edges and cell widths in float64, which keeps
+deep zooms exact and adds little to the file. `--float64-textures` also stores
+the texture data in float64, which doubles the textures' size; yt_idv still
+sends float32 to the GPU.
 
 ```python
 from yt_idv_export import export_block_scene
@@ -34,8 +47,8 @@ assembling from a checkpoint without yt (`--assemble`), `--dry-run` and
 ## Compatibility with yt_idv
 
 The scene file format (`FORMAT_VERSION`) and the yt_idv class paths written
-into it are fixed in this module. Exports with `--float64` need a yt_idv that
-can load float64 scenes.
+into it are fixed in this module. Exports with `--float64-textures` need a
+yt_idv that can load float64 textures.
 
 ## License
 

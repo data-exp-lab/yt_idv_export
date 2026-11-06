@@ -20,6 +20,7 @@ from yt_idv_export import (
 
 LEFT, RIGHT = [0.25, 0.3, 0.35], [0.65, 0.7, 0.75]
 
+
 @pytest.fixture()
 def region():
     ds = fake_amr_ds()
@@ -97,7 +98,12 @@ def test_checkpoint_from_another_export_is_rejected(region, tmp_path, monkeypatc
 
 
 def test_checkpoint_assembles_without_dataset(region, tmp_path, monkeypatch):
-    options = {"no_ghost": True, "float64": True, "render_method": "projection"}
+    options = {
+        "no_ghost": True,
+        "float64": True,
+        "float64_textures": True,
+        "render_method": "projection",
+    }
     expected = tmp_path / "expected.zip"
     export_block_scene(region, "Density", expected, **options)
 
@@ -321,9 +327,17 @@ def test_dry_run(region, tmp_path, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("float64", [False, True])
-def test_scene_file_layout(region, tmp_path, float64):
+@pytest.mark.parametrize("float64_textures", [False, True])
+def test_scene_file_layout(region, tmp_path, float64, float64_textures):
     filename = tmp_path / "scene.zip"
-    export_block_scene(region, "Density", filename, no_ghost=True, float64=float64)
+    export_block_scene(
+        region,
+        "Density",
+        filename,
+        no_ghost=True,
+        float64=float64,
+        float64_textures=float64_textures,
+    )
     contents = _zip_contents(filename)
     state = json.loads(contents["scene.json"])
     assert state["format_version"] == standalone_export.FORMAT_VERSION
@@ -333,11 +347,18 @@ def test_scene_file_layout(region, tmp_path, float64):
     assert data["class"] == standalone_export._DATA_CLASS
     assert tuple(data["traits"]["field"]) == ("stream", "Density")
 
+    def load(ref):
+        with zipfile.ZipFile(filename) as zf, zf.open(ref["__array__"]) as f:
+            return np.load(f)
+
     dtype = np.float64 if float64 else np.float32
+    attributes = data["attributes"]["vertex_array"]["__vertex_array__"]["attributes"]
+    for attribute in attributes:
+        if attribute["name"] in ("in_dx", "in_left_edge", "in_right_edge"):
+            assert load(attribute["data"]).dtype == dtype
+
+    texture_dtype = np.float64 if float64_textures else np.float32
     items = data["attributes"]["block_data"]["__items__"]
     assert len(items) > 0
     for _, ref in items:
-        path = ref["__array__"]
-        assert path in contents
-        with zipfile.ZipFile(filename) as zf, zf.open(path) as f:
-            assert np.load(f).dtype == dtype
+        assert load(ref).dtype == texture_dtype
