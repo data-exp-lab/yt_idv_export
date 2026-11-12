@@ -7,6 +7,7 @@ import zipfile
 
 import numpy as np
 import pytest
+from numpy.testing import assert_allclose
 from yt.testing import fake_amr_ds
 from yt.utilities.amr_kdtree.api import AMRKDTree
 
@@ -165,10 +166,13 @@ class _FakeComm:
             at_barrier()
 
 
-@pytest.mark.parametrize("no_ghost", [True, False])
-def test_parallel_export(region, tmp_path, monkeypatch, no_ghost):
+@pytest.mark.parametrize(
+    ("no_ghost", "coarse_nodes"), [(True, False), (False, False), (False, True)]
+)
+def test_parallel_export(region, tmp_path, monkeypatch, no_ghost, coarse_nodes):
+    options = {"no_ghost": no_ghost, "coarse_nodes": coarse_nodes}
     expected = tmp_path / "expected.zip"
-    export_block_scene(region, "Density", expected, no_ghost=no_ghost)
+    export_block_scene(region, "Density", expected, **options)
 
     filename = tmp_path / "scene.zip"
     size = 3
@@ -195,7 +199,7 @@ def test_parallel_export(region, tmp_path, monkeypatch, no_ghost):
     def run(comm):
         comms.append(comm)
         try:
-            export_block_scene(region, "Density", filename, no_ghost=no_ghost)
+            export_block_scene(region, "Density", filename, **options)
         finally:
             comms.pop()
 
@@ -210,7 +214,10 @@ def test_parallel_export(region, tmp_path, monkeypatch, no_ghost):
     run(_FakeComm(0, size, broadcasts, run_other_ranks))
 
     state = json.loads(_zip_contents(expected)["scene.json"])
-    n_blocks = len(state["data_objects"][0]["attributes"]["block_data"]["__items__"])
+    attributes = state["data_objects"][0]["attributes"]
+    n_blocks = len(attributes["block_data"]["__items__"])
+    if coarse_nodes:
+        n_blocks += len(attributes["_coarse_block_data"]["__items__"])
     assert len(calls) == len({node for _, node in calls}) == n_blocks
     assert {rank for rank, _ in calls} == set(range(size))
     # the ghost zones of each grid are made once, by the one rank given its blocks
@@ -362,3 +369,162 @@ def test_scene_file_layout(region, tmp_path, float64, float64_textures):
     assert len(items) > 0
     for _, ref in items:
         assert load(ref).dtype == texture_dtype
+
+
+def _scene(filename):
+    contents = _zip_contents(filename)
+    state = json.loads(contents["scene.json"])
+
+    def load(ref):
+        with zipfile.ZipFile(filename) as zf, zf.open(ref["__array__"]) as f:
+            return np.load(f)
+
+    return state["data_objects"][0]["attributes"], load
+
+
+def _walk(kd, coarse_block, i=0, parent=-1):
+    # the coarser block of each node of the flattened kd tree, depth first, with
+    # the coarser block covering it from above (or -1)
+    yield i, coarse_block[i], parent
+    if kd["left"][i] != -1:
+        here = coarse_block[i] if coarse_block[i] != -1 else parent
+        yield from _walk(kd, coarse_block, kd["left"][i], here)
+        yield from _walk(kd, coarse_block, kd["right"][i], here)
+
+
+@pytest.mark.parametrize("no_ghost", [True, False])
+def test_coarse_nodes(region, tmp_path, no_ghost):
+    plain = tmp_path / "plain.zip"
+    export_block_scene(region, "Density", plain, no_ghost=no_ghost)
+    filename = tmp_path / "scene.zip"
+    export_block_scene(
+        region, "Density", filename, no_ghost=no_ghost, coarse_nodes=True
+    )
+
+    # the leaves are written exactly as without the coarser blocks
+    expected = _zip_contents(plain)
+    contents = _zip_contents(filename)
+    state = json.loads(contents.pop("scene.json"))
+    attributes = state["data_objects"][0]["attributes"]
+    new = (
+        "_coarse_block_data",
+        "_coarse_block_bitmaps",
+        "_coarse_edges",
+        "_kd_coarse_block",
+    )
+    extra = {attributes.pop(k)["__array__"] for k in new[2:]}
+    for k in new[:2]:
+        extra |= {ref["__array__"] for _, ref in attributes.pop(k)["__items__"]}
+    assert state == json.loads(expected.pop("scene.json"))
+    assert {k: v for k, v in contents.items() if k not in extra} == expected
+
+    attributes, load = _scene(filename)
+    kd = {k: load(v) for k, v in attributes["_kd_tree"].items()}
+    coarse_block = load(attributes["_kd_coarse_block"])
+    assert coarse_block.shape == kd["block"].shape
+    edges = load(attributes["_coarse_edges"])
+    leaf_edges = load(attributes["_unscaled_edges"])
+    data = dict(attributes["_coarse_block_data"]["__items__"])
+    bitmaps = dict(attributes["_coarse_block_bitmaps"]["__items__"])
+    n_coarse = len(data)
+    assert n_coarse > 0
+    assert edges.shape == (3, n_coarse, 3)
+
+    # each coarser block appears once on a walk from the root, at an internal
+    # node, and covers the leaves below it with coarser cells
+    seen = []
+    for i, c, above in _walk(kd, coarse_block):
+        if kd["block"][i] != -1:
+            b = kd["block"][i]
+            if above != -1:
+                assert np.all(edges[0, above] <= leaf_edges[0, b] + 1e-12)
+                assert np.all(edges[1, above] >= leaf_edges[1, b] - 1e-12)
+                assert np.all(edges[2, above] >= leaf_edges[2, b] * (1 - 1e-9))
+        if c != -1:
+            assert kd["left"][i] != -1
+            assert above == -1 or np.all(edges[2, c] < edges[2, above] * (1 - 1e-9))
+            seen.append(int(c))
+    assert seen == list(range(n_coarse))
+
+    ratio = attributes["_unitary_per_code_length"]
+    max_val = state["data_objects"][0]["traits"]["max_val"]
+    tiles = AMRKDTree(region.ds, data_source=region)
+    tiles.fields = region._determine_fields(["Density"])
+    tiles.log_fields = [False]
+    tiles.no_ghost = no_ghost
+    coarse = standalone_export._coarse_nodes(tiles.tree.trunk)
+    assert len(coarse) == n_coarse
+    for j, node in enumerate(coarse):
+        brick = tiles.get_brick_data(node)
+        assert_allclose(edges[0, j], brick.LeftEdge * ratio)
+        assert_allclose(edges[1, j], brick.RightEdge * ratio)
+        assert np.array_equal(load(bitmaps[j]), brick.source_mask * 255)
+        expected = np.abs(np.asarray(brick.my_data[0])) / max_val
+        expected[expected == 0.0] = np.finfo(np.float32).tiny
+        assert np.array_equal(load(data[j]), expected.astype("f4"))
+
+
+def test_coarse_nodes_checkpoint(region, tmp_path, monkeypatch):
+    expected = tmp_path / "expected.zip"
+    export_block_scene(region, "Density", expected, coarse_nodes=True)
+
+    filename = tmp_path / "scene.zip"
+    checkpoint = tmp_path / "checkpoint"
+    get_brick_data = AMRKDTree.get_brick_data
+    calls = []
+
+    def interrupt_on_third(self, node):
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        calls.append(node)
+        return get_brick_data(self, node)
+
+    monkeypatch.setattr(AMRKDTree, "get_brick_data", interrupt_on_third)
+    with pytest.raises(KeyboardInterrupt):
+        export_block_scene(
+            region, "Density", filename, coarse_nodes=True, checkpoint_dir=checkpoint
+        )
+    monkeypatch.undo()
+    with pytest.raises(ValueError, match="different export .*coarse_nodes"):
+        export_block_scene(region, "Density", filename, checkpoint_dir=checkpoint)
+    export_block_scene(
+        region,
+        "Density",
+        filename,
+        coarse_nodes=True,
+        checkpoint_dir=checkpoint,
+        assemble=False,
+    )
+    assemble_scene(checkpoint, filename)
+    assert _zip_contents(filename) == _zip_contents(expected)
+
+
+def test_force_periodicity(tmp_path, monkeypatch):
+    ds = fake_amr_ds()
+    ds._periodicity = (False, False, False)
+    # the ghost zones at the domain's boundaries need periodicity
+    region = ds.region([0.5, 0.5, 0.5], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
+    with pytest.raises(RuntimeError, match="non-periodic domain"):
+        export_block_scene(region, "Density", tmp_path / "plain.zip")
+    export_block_scene(region, "Density", tmp_path / "plain.zip", no_ghost=True)
+
+    ds.force_periodicity()
+    expected = tmp_path / "expected.zip"
+    export_block_scene(region, "Density", expected)
+
+    filename = tmp_path / "scene.zip"
+    checkpoint = tmp_path / "checkpoint"
+
+    def interrupt(self, node):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(AMRKDTree, "get_brick_data", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        export_block_scene(region, "Density", filename, checkpoint_dir=checkpoint)
+    monkeypatch.undo()
+    ds.force_periodicity(False)
+    with pytest.raises(ValueError, match="different export .*force_periodicity"):
+        export_block_scene(region, "Density", filename, checkpoint_dir=checkpoint)
+    ds.force_periodicity()
+    export_block_scene(region, "Density", filename, checkpoint_dir=checkpoint)
+    assert _zip_contents(filename) == _zip_contents(expected)

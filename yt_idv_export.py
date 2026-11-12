@@ -4,8 +4,8 @@ Export a yt data source as a scene that ``yt_idv.SceneGraph.load`` can open.
 This file only depends on yt and numpy, so it can be copied to and run on a
 machine where yt_idv (or OpenGL) is not available:
 
-    yt-idv-export DATASET FIELD OUTPUT [--no-ghost] [--float64]
-        [--float64-textures] [--checkpoint-dir DIR]
+    yt-idv-export DATASET FIELD OUTPUT [--no-ghost] [--periodic] [--float64]
+        [--float64-textures] [--coarse-nodes] [--checkpoint-dir DIR]
 
 or, from python:
 
@@ -21,6 +21,19 @@ Then, wherever yt_idv is available:
 Only cartesian geometries are supported. The block processing mirrors
 ``BlockCollection.add_data`` and the file layout mirrors
 ``yt_idv.serialization``.
+
+The blocks are the leaves of yt's kd tree, which cover the data source once,
+each part with the finest data there. Where a finer grid was inserted into a
+coarser one, the kd tree node that was split still refers to the coarser grid.
+With ``--coarse-nodes`` the scene file also holds a block of the coarser data
+at the topmost such node of each grid, covering that node's whole subtree, so
+that a renderer could draw it in place of the finer blocks below. yt_idv renders
+the leaves as usual and leaves the coarser blocks alone.
+
+With ``--periodic`` the dataset is treated as periodic along every axis
+(``ds.force_periodicity()``), whatever its own periodicity, so that the ghost
+zones at the domain's boundaries are filled from the opposite side. From
+python, call ``ds.force_periodicity()`` before exporting.
 
 With ``--float64`` the vertex geometry (the blocks' edges and cell widths) is
 stored in float64, as yt_idv keeps it; yt_idv casts it down to float32 only for
@@ -281,6 +294,41 @@ def _flatten_kd_tree(trunk):
     }
 
 
+def _coarse_nodes(trunk):
+    """
+    The internal nodes of the kd tree that keep the coarser grid they were split
+    from, where that grid differs from their parent's: the topmost node of each
+    such region, which the grid covers whole. In depth-first order.
+    """
+    coarse = []
+    stack = [(trunk, -1)]
+    while stack:
+        node, parent_grid = stack.pop()
+        if node.kd_is_leaf():
+            continue
+        if node.grid != -1 and node.grid != parent_grid:
+            coarse.append(node)
+        stack.append((node.right, node.grid))
+        stack.append((node.left, node.grid))
+    return coarse
+
+
+def _add_coarse_blocks(trunk, tree, coarse):
+    # depth_traverse yields an internal node again after each of its subtrees,
+    # and _flatten_kd_tree keeps every copy, so each copy gets the index
+    index = {id(node): i for i, node in enumerate(coarse)}
+    tree["coarse_block"] = np.array(
+        [index.get(id(node), -1) for node in trunk.depth_traverse()], dtype="int64"
+    )
+
+
+def _n_blocks(tree):
+    """The number of leaf blocks and of coarser blocks."""
+    # the copies of a node share its index, so count by the largest
+    n_coarse = int(tree["coarse_block"].max()) + 1 if "coarse_block" in tree else 0
+    return int((tree["block"] >= 0).sum()), n_coarse
+
+
 class _MemoryStore:
     def __init__(self):
         self._store = {}
@@ -447,10 +495,10 @@ def _describe_block(grid, dims):
     return f"(grid {grid.id}, level {grid.Level}, {'x'.join(map(str, dims))} cells)"
 
 
-def _block_sizes(tiles, no_ghost):
+def _block_sizes(tiles, nodes, no_ghost):
     """The level, cell count and data size (with ghost zones) of each block."""
     levels, cells, values, grids = [], [], [], set()
-    for node in tiles.tree.trunk.kd_traverse():
+    for node in nodes:
         grid, dims = _block_shape(tiles, node)
         grids.add(grid.id)
         levels.append(grid.Level)
@@ -460,11 +508,16 @@ def _block_sizes(tiles, no_ghost):
     return np.array(levels), np.array(cells), np.array(values), len(grids)
 
 
-def _summarize_blocks(tiles, no_ghost, float64_textures):
-    levels, cells, values, n_grids = _block_sizes(tiles, no_ghost)
+def _summarize_blocks(tiles, nodes, no_ghost, float64_textures, n_coarse):
+    levels, cells, values, n_grids = _block_sizes(tiles, nodes, no_ghost)
+    coarse = (
+        f", and {n_coarse} blocks of coarser data at the nodes that were split"
+        if n_coarse
+        else ""
+    )
     lines = [
         f"{n_grids} of the dataset's {len(tiles.ds.index.grids)} grids are "
-        f"split into {len(levels)} blocks by the kd tree "
+        f"split into {len(levels) - n_coarse} blocks by the kd tree{coarse} "
         f"({cells.sum():,} cells); each block is a file in the checkpoint",
     ]
     for level in np.unique(levels):
@@ -474,9 +527,10 @@ def _summarize_blocks(tiles, no_ghost, float64_textures):
             f"{cells[on_level].sum():,} cells, "
             f"the largest {cells[on_level].max():,}"
         )
+    texture_bytes = values.sum() * (8 if float64_textures else 4)
     lines.append(
         f"expected size: about {_format_bytes(values.sum() * 8 + cells.sum())} "
-        f"of checkpoint, {_format_bytes(values.sum() * (8 if float64_textures else 4))} "
+        f"of checkpoint, {_format_bytes(texture_bytes)} "
         "of scene file before any compression"
     )
     return lines, values
@@ -564,6 +618,7 @@ def export_block_scene(
     compress=False,
     float64=False,
     float64_textures=False,
+    coarse_nodes=False,
     checkpoint_dir=None,
     assemble=True,
     log_interval=300,
@@ -584,6 +639,9 @@ def export_block_scene(
              float32 for the GPU); otherwise float32
     float64_textures: Store the texture data in float64 (yt_idv casts it to
                       float32 for the GPU); otherwise float32
+    coarse_nodes: Also store the coarser data at the kd tree nodes that were
+                  split where finer grids were inserted (see the module
+                  docstring); yt_idv renders only the leaves
     checkpoint_dir: A directory to save each block to as it is generated, so
                     that an interrupted export can be resumed by calling this
                     again with the same arguments; removed once the file has
@@ -602,11 +660,15 @@ def export_block_scene(
     started = time.monotonic()
     if root:
         _log(f"exporting {field} of {data_source} with {comm.size} rank(s)")
-    tiles, field, tree, bbox, manifest = _setup(data_source, field, no_ghost, comm)
+    tiles, nodes, field, tree, bbox, manifest = _setup(
+        data_source, field, no_ghost, coarse_nodes, comm
+    )
     ds = data_source.ds
     if root:
         _log(f"built the kd tree in {_format_seconds(time.monotonic() - started)}")
-        for line in _summarize_blocks(tiles, no_ghost, float64_textures)[0]:
+        for line in _summarize_blocks(
+            tiles, nodes, no_ghost, float64_textures, _n_blocks(tree)[1]
+        )[0]:
             _log(line)
     if checkpoint_dir is None and comm.size > 1:
         checkpoint_dir = f"{filename}.checkpoint"
@@ -648,7 +710,7 @@ def export_block_scene(
         }
         if checkpoint_dir is not None:
             store.save_scene(scene)
-    n_blocks = int((tree["block"] >= 0).sum())
+    n_blocks = sum(_n_blocks(tree))
     missing = None
     # names this run in the progress records, to tell it from earlier ones
     run = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -657,7 +719,6 @@ def export_block_scene(
             _log_checkpoint(store, checkpoint_dir, n_blocks)
         missing = sorted(set(range(n_blocks)) - store.saved())
     run, missing = comm.mpi_bcast((run, missing))
-    nodes = list(tiles.tree.trunk.kd_traverse())
     groups = _by_grid(missing, nodes)
     if root:
         _log(_plan(groups, comm.size))
@@ -697,7 +758,7 @@ def export_block_scene(
     comm.barrier()
 
 
-def _setup(data_source, field, no_ghost, comm):
+def _setup(data_source, field, no_ghost, coarse_nodes, comm):
     ds = data_source.ds
     geometry = str(ds.geometry)
     if geometry != "cartesian":
@@ -717,7 +778,13 @@ def _setup(data_source, field, no_ghost, comm):
     tiles.no_ghost = no_ghost
     field = tiles.fields[0]
 
+    # the leaves' blocks first, then the coarser blocks
+    nodes = list(tiles.tree.trunk.kd_traverse())
     tree = _flatten_kd_tree(tiles.tree.trunk)
+    if coarse_nodes:
+        coarse = _coarse_nodes(tiles.tree.trunk)
+        _add_coarse_blocks(tiles.tree.trunk, tree, coarse)
+        nodes += coarse
     bbox = np.array([edge.to("unitary").d for edge in data_source.get_bbox()])
     manifest = {
         "dataset": str(ds),
@@ -726,7 +793,14 @@ def _setup(data_source, field, no_ghost, comm):
         "no_ghost": bool(no_ghost),
         "bbox": bbox.tolist(),
     }
-    return tiles, field, tree, bbox, manifest
+    if coarse_nodes:
+        # only then, so that checkpoints from before the option still match
+        manifest["coarse_nodes"] = True
+    if getattr(ds, "_force_periodicity", False):
+        # the ghost zones at the domain's boundaries depend on it; recorded
+        # only then, for the same reason
+        manifest["force_periodicity"] = True
+    return tiles, nodes, field, tree, bbox, manifest
 
 
 def _plan(groups, n_ranks):
@@ -770,12 +844,16 @@ def _float64_textures(scene):
 
 def _write_scene(store, tree, scene, filename, log_interval=300):
     # Needs only numpy, so a checkpoint can be assembled on any machine.
-    n_blocks = int((tree["block"] >= 0).sum())
+    n_blocks, n_coarse = _n_blocks(tree)
+    tree = dict(tree)
+    coarse_block = tree.pop("coarse_block", None)
     started = time.monotonic()
     float64_textures = _float64_textures(scene)
+    coarse = f" and {n_coarse} coarser blocks" if n_coarse else ""
     _log(
-        f"writing {filename} from {n_blocks} blocks (float64={scene['float64']}, "
-        f"float64_textures={float64_textures}, compress={scene['compress']})"
+        f"writing {filename} from {n_blocks} blocks{coarse} "
+        f"(float64={scene['float64']}, float64_textures={float64_textures}, "
+        f"compress={scene['compress']})"
     )
     keys = ("left_edge", "right_edge", "dx", "min_val", "max_val")
     summary = []
@@ -823,29 +901,33 @@ def _write_scene(store, tree, scene, filename, log_interval=300):
                 ],
             }
 
-            block_data = []
-            block_bitmaps = []
-            progress = _Progress(
-                f"writing blocks to {partial}", n_blocks, interval=log_interval
-            )
-            with progress:
-                for i in range(n_blocks):
-                    progress.begin(i)
-                    block = store.load(i, ("data", "mask"))
-                    n_data = np.abs(block["data"]).astype("f8")
-                    if max_val > 0:
-                        # Divided by the maximum alone: subtracting the minimum
-                        # collapses values just above it toward 0, which a log
-                        # transfer function spreads over many decades.
-                        n_data /= max_val
-                        # zero-valued blocks are skipped by the shader
-                        n_data[n_data == 0.0] = np.finfo(np.float32).tiny
-                    n_data = n_data.astype(texture_dtype)
-                    block_data.append([i, archive.add_array(n_data)])
-                    block_bitmaps.append(
-                        [i, archive.add_array((block["mask"] * 255).astype("uint8"))]
-                    )
-                    progress.end(i)
+            def write_blocks(first, n, what):
+                block_data = []
+                block_bitmaps = []
+                progress = _Progress(
+                    f"writing {what} to {partial}", n, interval=log_interval
+                )
+                with progress:
+                    for j in range(n):
+                        progress.begin(j)
+                        block = store.load(first + j, ("data", "mask"))
+                        n_data = np.abs(block["data"]).astype("f8")
+                        if max_val > 0:
+                            # Divided by the maximum alone: subtracting the
+                            # minimum collapses values just above it toward 0,
+                            # which a log transfer function spreads over many
+                            # decades.
+                            n_data /= max_val
+                            # zero-valued blocks are skipped by the shader
+                            n_data[n_data == 0.0] = np.finfo(np.float32).tiny
+                        n_data = n_data.astype(texture_dtype)
+                        mask = (block["mask"] * 255).astype("uint8")
+                        block_data.append([j, archive.add_array(n_data)])
+                        block_bitmaps.append([j, archive.add_array(mask)])
+                        progress.end(j)
+                return block_data, block_bitmaps
+
+            block_data, block_bitmaps = write_blocks(0, n_blocks, "blocks")
 
             block_collection = {
                 "class": _DATA_CLASS,
@@ -874,6 +956,32 @@ def _write_scene(store, tree, scene, filename, log_interval=300):
                     "_unitary_per_code_length": ratio,
                 },
             }
+            if n_coarse:
+                # after the leaves', so that their arrays are named as without
+                coarse_data, coarse_bitmaps = write_blocks(
+                    n_blocks, n_coarse, "coarser blocks"
+                )
+                extents = [
+                    store.load(n_blocks + j, ("left_edge", "right_edge", "dx"))
+                    for j in range(n_coarse)
+                ]
+                block_collection["attributes"].update(
+                    {
+                        "_coarse_block_data": {"__items__": coarse_data},
+                        "_coarse_block_bitmaps": {"__items__": coarse_bitmaps},
+                        # as _unscaled_edges, for the coarser blocks
+                        "_coarse_edges": archive.add_array(
+                            np.array(
+                                [
+                                    [b[k] * ratio for b in extents]
+                                    for k in ("left_edge", "right_edge", "dx")
+                                ]
+                            )
+                        ),
+                        # the coarser block of each entry of _kd_tree, or -1
+                        "_kd_coarse_block": archive.add_array(coarse_block),
+                    }
+                )
             component = {
                 "class": _COMPONENT_CLASS,
                 "traits": {}
@@ -926,7 +1034,7 @@ def assemble_scene(checkpoint_dir, filename, log_interval=300):
             "version of this script; run the export once more to add it."
         ) from None
     tree = store.load_tree()
-    n_blocks = int((tree["block"] >= 0).sum())
+    n_blocks = sum(_n_blocks(tree))
     n_missing = len(set(range(n_blocks)) - store.saved())
     if n_missing:
         raise ValueError(
@@ -942,6 +1050,7 @@ def diagnose_export(
     no_ghost=False,
     float64=False,
     float64_textures=False,
+    coarse_nodes=False,
     checkpoint_dir=None,
     n_ranks=1,
     n_sample=0,
@@ -962,17 +1071,20 @@ def diagnose_export(
     no_ghost: As for export_block_scene
     float64: As for export_block_scene
     float64_textures: As for export_block_scene
+    coarse_nodes: As for export_block_scene
     checkpoint_dir: The checkpoint directory the export would use, if any
     n_ranks: The number of MPI ranks to plan for
     n_sample: The number of blocks to generate to time them
     """
     started = time.monotonic()
     _log(f"building the kd tree for {field} of {data_source}")
-    tiles, field, tree, bbox, manifest = _setup(
-        data_source, field, no_ghost, _communicator()
+    tiles, nodes, field, tree, bbox, manifest = _setup(
+        data_source, field, no_ghost, coarse_nodes, _communicator()
     )
     _log(f"built the kd tree in {_format_seconds(time.monotonic() - started)}")
-    lines, values = _summarize_blocks(tiles, no_ghost, float64_textures)
+    lines, values = _summarize_blocks(
+        tiles, nodes, no_ghost, float64_textures, _n_blocks(tree)[1]
+    )
     for line in lines:
         _log(line)
     n_blocks = len(values)
@@ -991,7 +1103,6 @@ def diagnose_export(
                 f"the checkpoint in {checkpoint_dir} can be resumed; it holds "
                 f"{n_blocks - len(missing)} of the {n_blocks} blocks"
             )
-    nodes = list(tiles.tree.trunk.kd_traverse())
     groups = _by_grid(missing, nodes)
     _log(_plan(groups, n_ranks))
     if not (n_sample and groups):
@@ -1055,7 +1166,7 @@ def inspect_checkpoint(checkpoint_dir, verify=False):
         )
 
     tree = store.load_tree()
-    n_blocks = int((tree["block"] >= 0).sum())
+    n_blocks = sum(_n_blocks(tree))
     saved, temporary = store._scan_blocks()
     blocks = {i: entry for i, entry in saved.items() if i < n_blocks}
     missing = sorted(set(range(n_blocks)) - set(blocks))
@@ -1279,6 +1390,18 @@ def main():
     )
     parser.add_argument("output", help="the scene file to write")
     parser.add_argument("--no-ghost", action="store_true", help="skip ghost zones")
+    parser.add_argument(
+        "--periodic",
+        action="store_true",
+        help="treat the dataset as periodic along every axis, whatever its own "
+        "periodicity, when filling ghost zones at the domain's boundaries",
+    )
+    parser.add_argument(
+        "--coarse-nodes",
+        action="store_true",
+        help="also store the coarser data at the kd tree nodes that were split "
+        "where finer grids were inserted (yt_idv renders only the leaves)",
+    )
     parser.add_argument("--render-method", default=None, help="e.g. projection")
     parser.add_argument("--compress", action="store_true", help="compress the file")
     parser.add_argument(
@@ -1342,6 +1465,8 @@ def main():
         yt.enable_parallelism()
     started = time.monotonic()
     ds = yt.load(args.dataset)
+    if args.periodic:
+        ds.force_periodicity()
     n_grids = len(ds.index.grids)
     if is_root():
         _log(
@@ -1357,6 +1482,7 @@ def main():
             no_ghost=args.no_ghost,
             float64=args.float64,
             float64_textures=args.float64_textures,
+            coarse_nodes=args.coarse_nodes,
             checkpoint_dir=args.checkpoint_dir,
             n_ranks=args.ranks,
             n_sample=args.sample,
@@ -1371,6 +1497,7 @@ def main():
         compress=args.compress,
         float64=args.float64,
         float64_textures=args.float64_textures,
+        coarse_nodes=args.coarse_nodes,
         checkpoint_dir=args.checkpoint_dir,
         assemble=not args.no_assemble,
         log_interval=args.log_interval,

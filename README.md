@@ -18,13 +18,30 @@ pip install .
 ```
 
 ```bash
-yt-idv-export DATASET FIELD scene.zip [--no-ghost] [--float64] [--float64-textures]
+yt-idv-export DATASET FIELD scene.zip [--no-ghost] [--periodic] [--float64] [--float64-textures]
 ```
+
+`--periodic` treats the dataset as periodic along every axis, whatever its own
+periodicity, so that the ghost zones at the domain's boundaries are filled from
+the opposite side (from python, call `ds.force_periodicity()` before exporting).
 
 `--float64` stores the blocks' edges and cell widths in float64, which keeps
 deep zooms exact and adds little to the file. `--float64-textures` also stores
 the texture data in float64, which doubles the textures' size; yt_idv still
 sends float32 to the GPU.
+
+The blocks are the leaves of yt's kd tree: they cover the data source once,
+each part with the finest data available there. When yt inserts a finer grid
+into a coarser one, the kd tree node it splits keeps referring to the coarser
+grid. With `--coarse-nodes` the scene file also stores the coarser data at the
+topmost such node of each grid, covering that node's whole subtree. This is
+the start of a level-of-detail hierarchy: a renderer could draw a coarse block
+in place of the finer blocks below it. The extra attributes are
+`_coarse_block_data`, `_coarse_block_bitmaps`, `_coarse_edges` (unitary
+float64 left edges, right edges and cell widths) and `_kd_coarse_block` (the
+coarse block at each `_kd_tree` entry, or -1). The leaves are written exactly
+as without the option, so yt_idv renders the scene as usual and ignores the
+coarse blocks.
 
 ```python
 from yt_idv_export import export_block_scene
